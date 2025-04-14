@@ -1,0 +1,999 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template for Route 53 Backup Solution - Branch Account Config Rule and Lambda Function"
+
+Metadata:
+  ParameterGroups:
+    - Label:
+        default: "S3 Backup Configuration"
+      Parameters:
+        - BackupBucketName
+    - Label:
+        default: "Lambda Function Configuration"
+      Parameters:
+        - UseConfigScheduledBackup
+        - LambdaLogRetentionDays
+    - Label:
+        default: "AWS Config Rule Configuration"
+      Parameters:
+        - ConfigRuleName
+        - ConfigLambdaFunctionName
+        - ConfigScheduledBackupFrequency
+    - Label:
+        default: "EventBridge Rule Configuration"
+      Parameters:
+        - EventBridgeLambdaFunctionName
+        - EventBridgeScheduledRuleName
+        - EventBridgeEventRuleName
+        - EventBridgeScheduledBackupFrequency
+
+  ParameterLabels:
+    BackupBucketName:
+      default: "Backup Bucket Name"
+    ConfigLambdaFunctionName:
+      default: "Config Lambda Function Name"
+    EventBridgeLambdaFunctionName:
+      default: "EventBridge Lambda Function Name"
+    LambdaLogRetentionDays:
+      default: "Lambda Log Retention Days"
+    ConfigRuleName:
+      default: "Config Rule Name"
+    ConfigScheduledBackupFrequency:
+      default: "Config Scheduled Backup Frequency"
+    UseConfigScheduledBackup:
+      default: "Use Config Scheduled Backup"
+    EventBridgeScheduledRuleName:
+      default: "EventBridge Scheduled Rule Name"
+    EventBridgeEventRuleName:
+      default: "EventBridge Event Rule Name"
+    EventBridgeScheduledBackupFrequency:
+      default: "EventBridge Scheduled Backup Frequency"
+
+Parameters:
+  # S3 Backup Configuration
+  BackupBucketName:
+    Type: String
+    Description: Name of the central S3 bucket to store Route 53 backups
+
+  # Lambda Function Configuration
+  ConfigLambdaFunctionName:
+    Type: String
+    Description: Name of the Lambda function that will perform the Route 53 backup
+    Default: Route53ConfigBackupFunction
+
+  EventBridgeLambdaFunctionName:
+    Type: String
+    Description: Name of the Lambda function for EventBridge scheduled backups
+    Default: Route53EventBridgeBackupFunction
+
+  LambdaLogRetentionDays:
+    Type: Number
+    Description: Number of days to retain CloudWatch logs for the Lambda function
+    Default: 14
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+
+  # AWS Config Rule Configuration
+  ConfigRuleName:
+    Type: String
+    Description: Name of the AWS Config rule to trigger the backup
+    Default: Route53BackupConfigRule
+
+  ConfigScheduledBackupFrequency:
+    Type: String
+    Description: Frequency for scheduled backups
+    Default: TwentyFour_Hours
+    AllowedValues:
+      - One_Hour
+      - Three_Hours
+      - Six_Hours
+      - Twelve_Hours
+      - TwentyFour_Hours
+
+  UseConfigScheduledBackup:
+    Type: String
+    Description: Whether to use AWS Config scheduled backup
+    Default: No
+    AllowedValues:
+      - Yes
+      - No
+
+  # EventBridge Rule Configuration
+  EventBridgeScheduledRuleName:
+    Type: String
+    Description: Name of the EventBridge rule for scheduled backups
+    Default: Route53BackupScheduledRule
+
+  EventBridgeEventRuleName:
+    Type: String
+    Description: Name of the EventBridge rule for event-based backups
+    Default: Route53BackupEventRule
+
+  EventBridgeScheduledBackupFrequency:
+    Type: String
+    Description: Schedule expression for regular backups (cron or rate)
+    Default: rate(24 hours)
+
+Conditions:
+  UseConfigScheduledBackupCondition:
+    !Equals [!Ref UseConfigScheduledBackup, "Yes"]
+  UseEventBridgeScheduledBackupCondition:
+    !Equals [!Ref UseConfigScheduledBackup, "No"]
+
+Resources:
+  # IAM Role for the Lambda function
+  Route53BackupLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: Route53BackupLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: Route53ReadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                  - route53:ListHostedZones
+                  - route53:ListHealthChecks
+                  - route53:ListCidrCollections
+                  - route53:ListCidrBlocks
+                  - route53:ListTrafficPolicies
+                  - route53:ListTrafficPolicyVersions
+                  - route53:GetTrafficPolicy
+                Resource: "*"
+
+        - PolicyName: S3WritePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BackupBucketName}/route53-backup/${AWS::AccountId}/*"
+
+        - PolicyName: ConfigEvaluationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                Resource: "*"
+
+  # AWS Config Rule to detect Route 53 Hosted Zone changes
+  Route53BackupConfigRule:
+    Condition: UseConfigScheduledBackupCondition
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: !Ref ConfigRuleName
+      Description: !Sub "Triggers a backup of Route 53 hosted zones on creation or configuration changes (${AWS::StackName})"
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::Route53::HostedZone"
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt Route53ConfigBackupFunction.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+          - EventSource: aws.config
+            MessageType: OversizedConfigurationItemChangeNotification
+          - EventSource: aws.config
+            MessageType: ScheduledNotification
+            MaximumExecutionFrequency: !Ref ConfigScheduledBackupFrequency
+    DependsOn: Route53BackupPermission
+
+  # Permission for AWS Config to invoke the Lambda function
+  Route53BackupPermission:
+    Condition: UseConfigScheduledBackupCondition
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt Route53ConfigBackupFunction.Arn
+      Principal: config.amazonaws.com
+
+  # CloudWatch Log Group for Lambda logs with explicit retention
+  Route53ConfigBackupFunctionLogGroup:
+    Condition: UseConfigScheduledBackupCondition
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ConfigLambdaFunctionName}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  # Lambda Function for Route 53 Backup
+  Route53ConfigBackupFunction:
+    Condition: UseConfigScheduledBackupCondition
+    Type: "AWS::Lambda::Function"
+    DependsOn: Route53ConfigBackupFunctionLogGroup
+    Properties:
+      FunctionName: !Ref ConfigLambdaFunctionName
+      Handler: index.handler
+      Role: !GetAtt Route53BackupLambdaRole.Arn
+      Runtime: python3.13
+      Timeout: 300
+      MemorySize: 128
+      LoggingConfig:
+        LogFormat: JSON
+      Environment:
+        Variables:
+          BACKUP_BUCKET_NAME: !Ref BackupBucketName
+          POWERTOOLS_SERVICE_NAME: !Ref ConfigLambdaFunctionName
+          POWERTOOLS_LOG_LEVEL: INFO
+      Layers:
+        - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:7"
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timezone
+          import uuid
+          from dataclasses import dataclass, field
+          from typing import Any, Optional
+          from aws_lambda_powertools import Logger
+          from aws_lambda_powertools.utilities.typing import LambdaContext
+          from aws_lambda_powertools.utilities.data_classes import (
+              AWSConfigRuleEvent,
+              event_source,
+          )
+
+          # Configure logger
+          logger = Logger()
+
+          # Global variables
+          aws_route53 = boto3.client("route53")
+          aws_s3 = boto3.client("s3")
+          aws_config = boto3.client("config")
+
+
+          @dataclass
+          class ConfigItem:
+              resource_id: str
+              resource_type: str
+              configuration_item_status: str
+
+              @classmethod
+              def from_dict(cls, data: dict[str, Any]) -> "ConfigItem":
+                  return cls(
+                      resource_id=data.get("resourceId", ""),
+                      resource_type=data.get("resourceType", ""),
+                      configuration_item_status=data.get("configurationItemStatus", "").lower(),
+                  )
+
+              @property
+              def is_route53_hosted_zone(self) -> bool:
+                  return self.resource_type == "AWS::Route53::HostedZone"
+
+              @property
+              def hosted_zone_id(self) -> str:
+                  return self.resource_id.split("/")[-1]
+
+              @property
+              def trigger_type(self) -> str:
+                  return (
+                      "creation"
+                      if self.configuration_item_status == "resourcediscovered"
+                      else "change"
+                  )
+
+
+          @dataclass
+          class ResourceRecordSet:
+              name: str
+              type: str
+              ttl: Optional[int] = None
+              resource_records: list[dict[str, str]] = field(default_factory=list)
+              alias_target: Optional[dict[str, Any]] = None
+
+              @classmethod
+              def from_dict(cls, data: dict[str, Any]) -> "ResourceRecordSet":
+                  return cls(
+                      name=data.get("Name", ""),
+                      type=data.get("Type", ""),
+                      ttl=data.get("TTL"),
+                      resource_records=data.get("ResourceRecords", []),
+                      alias_target=data.get("AliasTarget"),
+                  )
+
+
+          @dataclass
+          class HostedZoneDetails:
+              id: str
+              name: str
+              config: dict[str, Any]
+              resource_record_sets: list[ResourceRecordSet] = field(default_factory=list)
+
+              @property
+              def normalized_name(self) -> str:
+                  return self.name.rstrip(".")
+
+
+          @dataclass
+          class BackupMetadata:
+              account_id: str
+              hosted_zone_id: str
+              hosted_zone_name: str
+              trigger_type: str
+              timestamp: str = field(
+                  default_factory=lambda: datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+              )
+              backup_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+              def to_dict(self) -> dict[str, str]:
+                  return {
+                      "accountId": self.account_id,
+                      "hostedZoneId": self.hosted_zone_id,
+                      "hostedZoneName": self.hosted_zone_name,
+                      "triggerType": self.trigger_type,
+                      "timestamp": self.timestamp,
+                      "backupId": self.backup_id,
+                  }
+
+
+          def fetch_hosted_zone_details(zone_id: str) -> HostedZoneDetails:
+              """Fetch hosted zone details from Route53."""
+              logger.info(f"Fetching hosted zone details for {zone_id}")
+              hosted_zone_response = aws_route53.get_hosted_zone(Id=zone_id)
+              logger.debug(f"Hosted zone response: {hosted_zone_response}")
+
+              hosted_zone = hosted_zone_response["HostedZone"]
+              hosted_zone_details = HostedZoneDetails(
+                  id=zone_id, name=hosted_zone["Name"], config=hosted_zone
+              )
+
+              # Fetch all record sets
+              logger.info(f"Fetching resource record sets for zone {zone_id}")
+              record_sets = []
+
+              paginator = aws_route53.get_paginator("list_resource_record_sets")
+              page_iterator = paginator.paginate(HostedZoneId=zone_id)
+
+              for page in page_iterator:
+                  logger.debug(f"Retrieved {len(page['ResourceRecordSets'])} record sets")
+
+                  for record_set in page["ResourceRecordSets"]:
+                      record_sets.append(ResourceRecordSet.from_dict(record_set))
+
+              hosted_zone_details.resource_record_sets = record_sets
+              logger.info(f"Total record sets retrieved: {len(record_sets)}")
+
+              return hosted_zone_details
+
+
+          def create_backup_data(
+              zone_details: HostedZoneDetails, metadata: BackupMetadata
+          ) -> dict[str, Any]:
+              """Create the backup data structure."""
+              # Convert resource record sets to dicts for JSON serialization
+              record_sets_dicts = []
+              for rrs in zone_details.resource_record_sets:
+                  rrs_dict = {"Name": rrs.name, "Type": rrs.type}
+                  if rrs.ttl:
+                      rrs_dict["TTL"] = rrs.ttl
+                  if rrs.resource_records:
+                      rrs_dict["ResourceRecords"] = rrs.resource_records
+                  if rrs.alias_target:
+                      rrs_dict["AliasTarget"] = rrs.alias_target
+
+                  record_sets_dicts.append(rrs_dict)
+
+              # Create the backup structure
+              backup_data = {
+                  "metadata": metadata.to_dict(),
+                  "hostedZone": zone_details.config,
+                  "resourceRecordSets": record_sets_dicts,
+              }
+
+              return backup_data
+
+
+          def upload_to_s3(data: dict[str, Any], bucket_name: str, s3_key: str) -> bool:
+              """Upload the backup data to S3."""
+              try:
+                  logger.info(f"Uploading backup to s3://{bucket_name}/{s3_key}")
+                  aws_s3.put_object(
+                      Bucket=bucket_name,
+                      Key=s3_key,
+                      Body=json.dumps(data, indent=2),
+                      ContentType="application/json",
+                      ServerSideEncryption="AES256",
+                  )
+                  logger.info("Upload successful")
+                  return True
+              except Exception as e:
+                  logger.error(f"Error uploading to S3: {str(e)}")
+                  return False
+
+
+          def put_evaluations(
+              event: AWSConfigRuleEvent, compliance: str = "NON_COMPLIANT", annotation: str = ""
+          ) -> None:
+              aws_config.put_evaluations(
+                  Evaluations=[
+                      {
+                          "ComplianceResourceType": event.invoking_event.configuration_item.resource_type,
+                          "ComplianceResourceId": event.invoking_event.configuration_item.resource_id,
+                          "ComplianceType": compliance,
+                          "OrderingTimestamp": event.invoking_event.configuration_item.configuration_item_capture_time,
+                          "Annotation": annotation,
+                      },
+                  ],
+                  ResultToken=event.result_token,
+              )
+
+
+          @logger.inject_lambda_context
+          @event_source(data_class=AWSConfigRuleEvent)
+          def handler(event: AWSConfigRuleEvent, context: LambdaContext) -> None:
+              """
+              Lambda function handler to backup Route 53 hosted zones.
+              This function is triggered by AWS Config when a Route 53 hosted zone
+              is created or modified.
+              """
+              try:
+                  logger.info("Starting Route53 backup process")
+                  compliance = "NON_COMPLIANT"
+                  annotation = ""
+                  # Get hosted zone details
+                  hosted_zone_id = event.invoking_event.configuration_item.resource_id
+                  account_id = event.invoking_event.configuration_item.accountid
+                  trigger_type = (
+                      "change"
+                      if event.invoking_event.message_type
+                      == "ConfigurationItemChangeNotification"
+                      else "creation"
+                  )
+
+                  logger.info(
+                      {
+                          "message": "Processing Route53 hosted zone",
+                          "hosted_zone_id": hosted_zone_id,
+                          "trigger_type": trigger_type,
+                      }
+                  )
+
+                  # Fetch hosted zone details
+                  zone_details = fetch_hosted_zone_details(hosted_zone_id)
+
+                  # Create backup metadata
+                  metadata = BackupMetadata(
+                      account_id=account_id,
+                      hosted_zone_id=hosted_zone_id,
+                      hosted_zone_name=zone_details.normalized_name,
+                      trigger_type=trigger_type,
+                  )
+
+                  # Create backup data
+                  backup_data = create_backup_data(zone_details, metadata)
+
+                  # Prepare S3 key
+                  s3_key = f"route53-backup/{account_id}/{zone_details.normalized_name}/{trigger_type}-{metadata.timestamp}.json"
+
+                  # Upload to S3
+                  bucket_name = os.environ["BACKUP_BUCKET_NAME"]
+                  success = upload_to_s3(backup_data, bucket_name, s3_key)
+
+                  if success:
+                      compliance = "COMPLIANT"
+                      annotation = f"Successfully backed up hosted zone {hosted_zone_id}"
+                      logger.info(
+                          {
+                              "message": "Successfully backed up hosted zone",
+                              "hosted_zone_id": hosted_zone_id,
+                              "s3_location": f"s3://{bucket_name}/{s3_key}",
+                          }
+                      )
+                  else:
+                      annotation = f"Failed to upload backup for hosted zone {hosted_zone_id}"
+                      logger.error(
+                          {"message": "Failed to upload backup", "hosted_zone_id": hosted_zone_id}
+                      )
+
+              except Exception as e:
+                  logger.exception("Error in Route53 backup process")
+                  annotation = f"Error processing hosted zone: {str(e)}"
+
+              put_evaluations(
+                  event,
+                  compliance=compliance,
+                  annotation=annotation,
+              )
+
+  # EventBridge Rule for scheduled backups
+  EventBridgeScheduledBackupRule:
+    Condition: UseEventBridgeScheduledBackupCondition
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref EventBridgeScheduledRuleName
+      Description: Scheduled trigger for Route 53 backup Lambda function
+      ScheduleExpression: !Ref EventBridgeScheduledBackupFrequency
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventBridgeRoute53BackupLambda.Arn
+          Id: Route53BackupTarget
+
+  EventBridgeChangeBackupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref EventBridgeEventRuleName
+      Description: Change-driven trigger for Route 53 backup Lambda function
+      EventPattern:
+        source:
+          - aws.route53
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - route53.amazonaws.com
+          eventName:
+            - ChangeResourceRecordSets
+            - CreateHostedZone
+            - UpdateHealthCheck
+            - ChangeCidrCollection
+            - UpdateTrafficPolicyInstance
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventBridgeRoute53BackupLambda.Arn
+          Id: Route53ChangeBackupTarget
+
+  PermissionForEventsToInvokeLambdaScheduled:
+    Condition: UseEventBridgeScheduledBackupCondition
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventBridgeRoute53BackupLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeScheduledBackupRule.Arn
+
+  PermissionForEventsToInvokeLambdaChange:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventBridgeRoute53BackupLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeChangeBackupRule.Arn
+
+  EventBridgeLambdaLogGroup:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${EventBridgeLambdaFunctionName}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  EventBridgeRoute53BackupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref EventBridgeLambdaFunctionName
+      Description: "Event Driven lambda function to backup Route 53 hosted zones"
+      Handler: index.handler
+      Runtime: python3.13
+      Role: !GetAtt Route53BackupLambdaRole.Arn
+      Timeout: 120
+      LoggingConfig:
+        LogFormat: JSON
+      Environment:
+        Variables:
+          BACKUP_BUCKET_NAME: !Ref BackupBucketName
+          POWERTOOLS_SERVICE_NAME: !Ref ConfigLambdaFunctionName
+          POWERTOOLS_LOG_LEVEL: INFO
+      Layers:
+        - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:7"
+      Code:
+        ZipFile: |
+          import json, os, datetime, urllib.parse, uuid
+          import boto3
+          from dataclasses import dataclass, field
+          from typing import Any, Optional, Literal, Callable
+          from aws_lambda_powertools import Logger
+          from aws_lambda_powertools.utilities.typing import LambdaContext
+          from aws_lambda_powertools.utilities.data_classes import EventBridgeEvent, event_source
+
+          logger = Logger()
+          aws_route53 = boto3.client("route53")
+          aws_s3 = boto3.client("s3")
+
+
+          # -----------------------
+          # Data Models
+          # -----------------------
+          @dataclass
+          class EventInfo:
+              event_details: dict[str, Any] = field(default_factory=dict)
+              trigger_type: Literal["scheduled", "change"] = "scheduled"
+              event_name: Optional[str] = None
+              affected_zone_id: Optional[str] = None
+              changes: Optional[list[dict[str, Any]]] = None
+
+              @property
+              def is_change_event(self) -> bool:
+                  return self.trigger_type == "change"
+
+              @property
+              def is_scheduled_event(self) -> bool:
+                  return self.trigger_type == "scheduled"
+
+
+          @dataclass
+          class BackupMetadata:
+              account_id: str
+              hosted_zone_id: str
+              hosted_zone_name: str
+              trigger_type: str
+              timestamp: str
+              backup_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+              direct_change: bool = False
+              change_event_name: Optional[str] = None
+
+              def to_dict(self) -> dict[str, Any]:
+                  base = {
+                      "accountId": self.account_id,
+                      "hostedZoneId": self.hosted_zone_id,
+                      "hostedZoneName": self.hosted_zone_name,
+                      "triggerType": self.trigger_type,
+                      "timestamp": self.timestamp,
+                      "backupId": self.backup_id,
+                  }
+                  if self.change_event_name:
+                      base["changeEventName"] = self.change_event_name
+                  if self.direct_change:
+                      base["directChange"] = self.direct_change
+                  return base
+
+
+          @dataclass
+          class BackupData:
+              metadata: BackupMetadata
+              hosted_zone: dict[str, Any]
+              resource_record_sets: list[dict[str, Any]] = field(default_factory=list)
+              health_checks: list[dict[str, Any]] = field(default_factory=list)
+              cidr_blocks: list[dict[str, Any]] = field(default_factory=list)
+              traffic_policies: list[dict[str, Any]] = field(default_factory=list)
+              changes: Optional[list[dict[str, Any]]] = None
+
+
+          # -----------------------
+          # AWS Calls Helpers
+          # -----------------------
+          def paginate(client, method_name: str, result_key: str, **kwargs) -> list:
+              results = []
+              paginator = client.get_paginator(method_name)
+              for page in paginator.paginate(**kwargs):
+                  results.extend(page.get(result_key, []))
+              return results
+
+
+          def get_hosted_zones() -> list[dict[str, Any]]:
+              return paginate(aws_route53, "list_hosted_zones", "HostedZones")
+
+
+          def get_record_sets(zone_id: str) -> list[dict[str, Any]]:
+              return paginate(
+                  aws_route53,
+                  "list_resource_record_sets",
+                  "ResourceRecordSets",
+                  HostedZoneId=zone_id,
+              )
+
+
+          def get_health_checks() -> list[dict[str, Any]]:
+              return paginate(aws_route53, "list_health_checks", "HealthChecks")
+
+
+          def get_cidr_blocks() -> list[dict[str, Any]]:
+              collections = []
+              try:
+                  response = aws_route53.list_cidr_collections()
+                  for coll in response.get("CidrCollections", []):
+                      try:
+                          coll["CidrBlocks"] = aws_route53.list_cidr_blocks(
+                              CollectionId=coll["Id"]
+                          ).get("CidrBlocks", [])
+                          collections.append(coll)
+                      except Exception as e:
+                          logger.error(f"CIDR blocks retrieval error for {coll['Id']}: {str(e)}")
+              except Exception as e:
+                  logger.error(f"Error listing CIDR collections: {str(e)}")
+              return collections
+
+
+          def get_traffic_policies() -> list[dict[str, Any]]:
+              policies = []
+              try:
+                  response = aws_route53.list_traffic_policies()
+                  for policy in response.get("TrafficPolicySummaries", []):
+                      try:
+                          versions = aws_route53.list_traffic_policy_versions(
+                              Id=policy["Id"]
+                          ).get("TrafficPolicies", [])
+                          policy["PolicyVersions"] = versions
+                          policies.append(policy)
+                      except Exception as e:
+                          logger.error(f"Error for policy {policy['Id']}: {str(e)}")
+              except Exception as e:
+                  logger.error(f"Error listing traffic policies: {str(e)}")
+              return policies
+
+
+          def get_traffic_policy(policy_id: str, policy_version: str) -> dict[str, Any]:
+              try:
+                  response = aws_route53.get_traffic_policy(Id=policy_id, Version=policy_version)
+                  if response.get("TrafficPolicy", {}).get("Document"):
+                      response["TrafficPolicy"]["Document"] = json.loads(
+                          response["TrafficPolicy"]["Document"]
+                      )
+                  return response.get("TrafficPolicy", {})
+              except Exception as e:
+                  logger.error(f"Error retrieving traffic policy {policy_id}: {str(e)}")
+                  return {}
+
+
+          # -----------------------
+          # Helpers
+          # -----------------------
+          def normalize_zone_id(zone_id: str) -> str:
+              return zone_id.split("/")[-1] if zone_id.startswith("/hostedzone/") else zone_id
+
+
+          def normalize_zone_info(zone: dict[str, Any]) -> tuple[str, str]:
+              if not zone.get("Id"):
+                  raise ValueError("Zone ID is missing or None")
+              normalized_id = normalize_zone_id(zone["Id"])
+              normalized_name = zone["Name"].rstrip(".")
+              return normalized_id, normalized_name
+
+
+          def extract_bucket_name(bucket_identifier: str) -> str:
+              if bucket_identifier.startswith("arn:aws:s3:::"):
+                  return bucket_identifier.split(":")[-1]
+              return bucket_identifier
+
+
+          # -----------------------
+          # Backup Data Builders
+          # -----------------------
+          def build_metadata(
+              zone: dict[str, Any], account_id: str, event: EventInfo, timestamp: str
+          ) -> BackupMetadata:
+              zone_id, zone_name = normalize_zone_info(zone)
+              return BackupMetadata(
+                  account_id=account_id,
+                  hosted_zone_id=zone_id,
+                  hosted_zone_name=zone_name,
+                  trigger_type=event.trigger_type,
+                  timestamp=timestamp,
+                  change_event_name=event.event_name if event.is_change_event else None,
+                  direct_change=(event.affected_zone_id == zone_id),
+              )
+
+
+          def create_backup_data(
+              zone: dict[str, Any],
+              record_sets: list[dict[str, Any]],
+              account_id: str,
+              event: EventInfo,
+              timestamp: str,
+              include_resources: bool = False,
+          ) -> BackupData:
+              metadata = build_metadata(zone, account_id, event, timestamp)
+              backup = BackupData(metadata=metadata, hosted_zone=zone)
+              if event.is_change_event:
+                  backup.changes = event.changes
+              else:
+                  backup.resource_record_sets = record_sets
+                  if include_resources:
+                      backup.health_checks = get_health_checks()
+                      backup.cidr_blocks = get_cidr_blocks()
+                      backup.traffic_policies = get_traffic_policies()
+              return backup
+
+
+          def upload_to_s3(
+              backup: BackupData, zone_name: str, account_id: str, trigger: str, timestamp: str
+          ) -> bool:
+              try:
+                  safe_zone = urllib.parse.quote(zone_name, safe="")
+                  trigger_suffix = {
+                      "Scheduled Event": "schedule",
+                      "ChangeResourceRecordSets": "records",
+                      "ChangeCidrCollection": "cidr",
+                      "UpdateHealthCheck": "healthcheck",
+                      "UpdateTrafficPolicyInstance": "trafficpolicy",
+                  }.get(trigger, "schedule")
+                  s3_key = (
+                      f"route53-backup/{account_id}/{safe_zone}/{trigger_suffix}-{timestamp}.json"
+                  )
+                  bucket = extract_bucket_name(os.environ["BACKUP_BUCKET_NAME"])
+                  data = {"metadata": backup.metadata.to_dict(), "hostedZone": backup.hosted_zone}
+                  if trigger == "scheduled":
+                      data.update(
+                          {
+                              "resourceRecordSets": backup.resource_record_sets,
+                              "healthChecks": backup.health_checks,
+                              "cidrBlocks": backup.cidr_blocks,
+                              "trafficPolicies": backup.traffic_policies,
+                          }
+                      )
+                  else:
+                      data[trigger_suffix] = backup.changes
+                  aws_s3.put_object(
+                      Bucket=bucket,
+                      Key=s3_key,
+                      Body=json.dumps(data, indent=2, default=str),
+                      ContentType="application/json",
+                      ServerSideEncryption="AES256",
+                  )
+                  logger.info(f"Uploaded backup to s3://{bucket}/{s3_key}")
+                  return True
+              except Exception as e:
+                  logger.exception(f"Failed to upload backup for zone {zone_name}: {str(e)}")
+                  return False
+
+
+          # -----------------------
+          # Shared Backup Processing
+          # -----------------------
+          def process_zone_backup(
+              zone: dict[str, Any],
+              account_id: str,
+              event: EventInfo,
+              timestamp: str,
+              record_set_loader: Callable[[str], list[dict[str, Any]]],
+              include_resources: bool = False,
+          ) -> bool:
+              """Common logic to create backup data for a zone and upload it to S3."""
+              zone_id, zone_name = normalize_zone_info(zone)
+              record_sets = record_set_loader(zone_id)
+              backup = create_backup_data(
+                  zone, record_sets, account_id, event, timestamp, include_resources
+              )
+              return upload_to_s3(backup, zone_name, account_id, event.event_name, timestamp)
+
+
+          # -----------------------
+          # Event Handlers
+          # -----------------------
+          def parse_event(event: EventBridgeEvent) -> EventInfo:
+              info = EventInfo()
+              if event.source == "aws.events" and event.detail_type == "Scheduled Event":
+                  logger.info("Processing Scheduled Event")
+                  return info
+              if (
+                  event.source == "aws.route53"
+                  and event.detail_type == "AWS API Call via CloudTrail"
+              ):
+                  info.trigger_type = "change"
+                  info.event_name = event.detail.get("eventName", "")
+                  info.event_details = event.detail
+                  req_params = event.detail.get("requestParameters", {})
+
+                  if info.event_name == "ChangeCidrCollection":
+                      logger.info("Processing ChangeCidrCollection event")
+                      info.changes = req_params.get("changes", [])
+                  if info.event_name == "UpdateHealthCheck":
+                      logger.info("Processing UpdateHealthCheck event")
+                      info.changes = req_params
+                  if info.event_name == "UpdateTrafficPolicyInstance":
+                      logger.info("Processing UpdateTrafficPolicyInstance event")
+                      info.changes = get_traffic_policy(
+                          req_params.get("trafficPolicyId", ""),
+                          req_params.get("trafficPolicyVersion", ""),
+                      )
+                      info.affected_zone_id = normalize_zone_id(
+                          event.detail["responseElements"]["trafficPolicyInstance"][
+                              "hostedZoneId"
+                          ]
+                      )
+                  if info.event_name == "ChangeResourceRecordSets":
+                      logger.info("Processing ChangeResourceRecordSets event")
+                      info.changes = req_params.get("changeBatch", {}).get("changes", [])
+                      info.affected_zone_id = normalize_zone_id(req_params["hostedZoneId"])
+                  logger.info(f"Extracted {len(info.changes) if info.changes else 0} changes")
+                  logger.info(
+                      f"Processing change event: {info.event_name}, zone ID: {info.affected_zone_id}"
+                  )
+              return info
+
+
+          def handle_scheduled_event(
+              account_id: str, event_info: EventInfo, timestamp: str
+          ) -> None:
+              zones = get_hosted_zones()
+              if not zones:
+                  logger.warning("No hosted zones available for backup")
+                  return
+              for zone in zones:
+                  # Process each zone with its record sets and additional resources
+                  process_zone_backup(
+                      zone,
+                      account_id,
+                      event_info,
+                      timestamp,
+                      get_record_sets,
+                      include_resources=True,
+                  )
+
+
+          def handle_change_event(account_id: str, event_info: EventInfo, timestamp: str) -> None:
+              zone = {}
+              if event_info.affected_zone_id:
+                  try:
+                      zone = aws_route53.get_hosted_zone(Id=event_info.affected_zone_id)[
+                          "HostedZone"
+                      ]
+                      zone["Id"], zone["Name"] = normalize_zone_info(zone)
+                  except Exception as e:
+                      logger.error(f"Error retrieving hosted zone: {str(e)}")
+                      zone = {"Id": event_info.affected_zone_id, "Name": "Unknown"}
+              if event_info.event_name in {"ChangeCidrCollection", "UpdateHealthCheck"}:
+                  # Use fallback zone name for certain change events
+                  fallback_name = {
+                      "ChangeCidrCollection": "CIDRCollection",
+                      "UpdateHealthCheck": "HealthCheckUpdate",
+                  }.get(event_info.event_name, "Unknown")
+                  zone = {
+                      "Id": event_info.affected_zone_id or fallback_name,
+                      "Name": fallback_name,
+                  }
+              process_zone_backup(
+                  zone, account_id, event_info, timestamp, lambda _: [], include_resources=False
+              )
+
+
+          @logger.inject_lambda_context(log_event=True)
+          @event_source(data_class=EventBridgeEvent)
+          def handler(event: EventBridgeEvent, context: LambdaContext) -> None:
+              timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+                  "%Y%m%dT%H%M%S.%fZ"
+              )[:-3]
+              event_info = parse_event(event)
+              account_id = event.account
+              if event_info.is_scheduled_event:
+                  handle_scheduled_event(account_id, event_info, timestamp)
+              elif event_info.is_change_event:
+                  handle_change_event(account_id, event_info, timestamp)
+              else:
+                  logger.warning("Unsupported event type")
+
+Outputs:
+  ConfigLambdaFunctionArn:
+    Condition: UseConfigScheduledBackupCondition
+    Description: ARN of the Route 53 backup Lambda function
+    Value: !GetAtt Route53ConfigBackupFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaArn"
+
+  LambdaRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt Route53BackupLambdaRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleArn"
+
+  EventBridgeLambdaFunctionArn:
+    Description: ARN of the EventBridge Route 53 backup Lambda function
+    Value: !GetAtt EventBridgeRoute53BackupLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeLambdaArn"

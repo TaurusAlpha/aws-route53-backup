@@ -1,0 +1,373 @@
+import json, os, datetime, urllib.parse, uuid
+import boto3
+from dataclasses import dataclass, field
+from typing import Any, Optional, Literal, Callable
+from aws_lambda_powertools import Logger
+from aws_lambda_powertools.utilities.typing import LambdaContext
+from aws_lambda_powertools.utilities.data_classes import EventBridgeEvent, event_source
+
+logger = Logger()
+aws_route53 = boto3.client("route53")
+aws_s3 = boto3.client("s3")
+
+
+# -----------------------
+# Data Models
+# -----------------------
+@dataclass
+class EventInfo:
+    event_details: dict[str, Any] = field(default_factory=dict)
+    trigger_type: Literal["scheduled", "change"] = "scheduled"
+    event_name: Optional[str] = None
+    affected_zone_id: Optional[str] = None
+    changes: Optional[list[dict[str, Any]]] = None
+
+    @property
+    def is_change_event(self) -> bool:
+        return self.trigger_type == "change"
+
+    @property
+    def is_scheduled_event(self) -> bool:
+        return self.trigger_type == "scheduled"
+
+
+@dataclass
+class BackupMetadata:
+    account_id: str
+    hosted_zone_id: str
+    hosted_zone_name: str
+    trigger_type: str
+    timestamp: str
+    backup_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    direct_change: bool = False
+    change_event_name: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        base = {
+            "accountId": self.account_id,
+            "hostedZoneId": self.hosted_zone_id,
+            "hostedZoneName": self.hosted_zone_name,
+            "triggerType": self.trigger_type,
+            "timestamp": self.timestamp,
+            "backupId": self.backup_id,
+        }
+        if self.change_event_name:
+            base["changeEventName"] = self.change_event_name
+        if self.direct_change:
+            base["directChange"] = self.direct_change
+        return base
+
+
+@dataclass
+class BackupData:
+    metadata: BackupMetadata
+    hosted_zone: dict[str, Any]
+    resource_record_sets: list[dict[str, Any]] = field(default_factory=list)
+    health_checks: list[dict[str, Any]] = field(default_factory=list)
+    cidr_blocks: list[dict[str, Any]] = field(default_factory=list)
+    traffic_policies: list[dict[str, Any]] = field(default_factory=list)
+    changes: Optional[list[dict[str, Any]]] = None
+
+
+# -----------------------
+# AWS Calls Helpers
+# -----------------------
+def paginate(client, method_name: str, result_key: str, **kwargs) -> list:
+    results = []
+    paginator = client.get_paginator(method_name)
+    for page in paginator.paginate(**kwargs):
+        results.extend(page.get(result_key, []))
+    return results
+
+
+def get_hosted_zones() -> list[dict[str, Any]]:
+    return paginate(aws_route53, "list_hosted_zones", "HostedZones")
+
+
+def get_record_sets(zone_id: str) -> list[dict[str, Any]]:
+    return paginate(
+        aws_route53,
+        "list_resource_record_sets",
+        "ResourceRecordSets",
+        HostedZoneId=zone_id,
+    )
+
+
+def get_health_checks() -> list[dict[str, Any]]:
+    return paginate(aws_route53, "list_health_checks", "HealthChecks")
+
+
+def get_cidr_blocks() -> list[dict[str, Any]]:
+    collections = []
+    try:
+        response = aws_route53.list_cidr_collections()
+        for coll in response.get("CidrCollections", []):
+            try:
+                coll["CidrBlocks"] = aws_route53.list_cidr_blocks(
+                    CollectionId=coll["Id"]
+                ).get("CidrBlocks", [])
+                collections.append(coll)
+            except Exception as e:
+                logger.error(f"CIDR blocks retrieval error for {coll['Id']}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error listing CIDR collections: {str(e)}")
+    return collections
+
+
+def get_traffic_policies() -> list[dict[str, Any]]:
+    policies = []
+    try:
+        response = aws_route53.list_traffic_policies()
+        for policy in response.get("TrafficPolicySummaries", []):
+            try:
+                versions = aws_route53.list_traffic_policy_versions(
+                    Id=policy["Id"]
+                ).get("TrafficPolicies", [])
+                policy["PolicyVersions"] = versions
+                policies.append(policy)
+            except Exception as e:
+                logger.error(f"Error for policy {policy['Id']}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error listing traffic policies: {str(e)}")
+    return policies
+
+
+def get_traffic_policy(policy_id: str, policy_version: str) -> dict[str, Any]:
+    try:
+        response = aws_route53.get_traffic_policy(Id=policy_id, Version=policy_version)
+        if response.get("TrafficPolicy", {}).get("Document"):
+            response["TrafficPolicy"]["Document"] = json.loads(
+                response["TrafficPolicy"]["Document"]
+            )
+        return response.get("TrafficPolicy", {})
+    except Exception as e:
+        logger.error(f"Error retrieving traffic policy {policy_id}: {str(e)}")
+        return {}
+
+
+# -----------------------
+# Helpers
+# -----------------------
+def normalize_zone_id(zone_id: str) -> str:
+    return zone_id.split("/")[-1] if zone_id.startswith("/hostedzone/") else zone_id
+
+
+def normalize_zone_info(zone: dict[str, Any]) -> tuple[str, str]:
+    if not zone.get("Id"):
+        raise ValueError("Zone ID is missing or None")
+    normalized_id = normalize_zone_id(zone["Id"])
+    normalized_name = zone["Name"].rstrip(".")
+    return normalized_id, normalized_name
+
+
+def extract_bucket_name(bucket_identifier: str) -> str:
+    if bucket_identifier.startswith("arn:aws:s3:::"):
+        return bucket_identifier.split(":")[-1]
+    return bucket_identifier
+
+
+# -----------------------
+# Backup Data Builders
+# -----------------------
+def build_metadata(
+    zone: dict[str, Any], account_id: str, event: EventInfo, timestamp: str
+) -> BackupMetadata:
+    zone_id, zone_name = normalize_zone_info(zone)
+    return BackupMetadata(
+        account_id=account_id,
+        hosted_zone_id=zone_id,
+        hosted_zone_name=zone_name,
+        trigger_type=event.trigger_type,
+        timestamp=timestamp,
+        change_event_name=event.event_name if event.is_change_event else None,
+        direct_change=(event.affected_zone_id == zone_id),
+    )
+
+
+def create_backup_data(
+    zone: dict[str, Any],
+    record_sets: list[dict[str, Any]],
+    account_id: str,
+    event: EventInfo,
+    timestamp: str,
+    include_resources: bool = False,
+) -> BackupData:
+    metadata = build_metadata(zone, account_id, event, timestamp)
+    backup = BackupData(metadata=metadata, hosted_zone=zone)
+    if event.is_change_event:
+        backup.changes = event.changes
+    else:
+        backup.resource_record_sets = record_sets
+        if include_resources:
+            backup.health_checks = get_health_checks()
+            backup.cidr_blocks = get_cidr_blocks()
+            backup.traffic_policies = get_traffic_policies()
+    return backup
+
+
+def upload_to_s3(
+    backup: BackupData, zone_name: str, account_id: str, trigger: str, timestamp: str
+) -> bool:
+    try:
+        safe_zone = urllib.parse.quote(zone_name, safe="")
+        trigger_suffix = {
+            "Scheduled Event": "schedule",
+            "ChangeResourceRecordSets": "records",
+            "ChangeCidrCollection": "cidr",
+            "UpdateHealthCheck": "healthcheck",
+            "UpdateTrafficPolicyInstance": "trafficpolicy",
+        }.get(trigger, "schedule")
+        s3_key = (
+            f"route53-backup/{account_id}/{safe_zone}/{trigger_suffix}-{timestamp}.json"
+        )
+        bucket = extract_bucket_name(os.environ["BACKUP_BUCKET_NAME"])
+        data = {"metadata": backup.metadata.to_dict(), "hostedZone": backup.hosted_zone}
+        if trigger == "scheduled":
+            data.update(
+                {
+                    "resourceRecordSets": backup.resource_record_sets,
+                    "healthChecks": backup.health_checks,
+                    "cidrBlocks": backup.cidr_blocks,
+                    "trafficPolicies": backup.traffic_policies,
+                }
+            )
+        else:
+            data[trigger_suffix] = backup.changes
+        aws_s3.put_object(
+            Bucket=bucket,
+            Key=s3_key,
+            Body=json.dumps(data, indent=2, default=str),
+            ContentType="application/json",
+            ServerSideEncryption="AES256",
+        )
+        logger.info(f"Uploaded backup to s3://{bucket}/{s3_key}")
+        return True
+    except Exception as e:
+        logger.exception(f"Failed to upload backup for zone {zone_name}: {str(e)}")
+        return False
+
+
+# -----------------------
+# Shared Backup Processing
+# -----------------------
+def process_zone_backup(
+    zone: dict[str, Any],
+    account_id: str,
+    event: EventInfo,
+    timestamp: str,
+    record_set_loader: Callable[[str], list[dict[str, Any]]],
+    include_resources: bool = False,
+) -> bool:
+    """Common logic to create backup data for a zone and upload it to S3."""
+    zone_id, zone_name = normalize_zone_info(zone)
+    record_sets = record_set_loader(zone_id)
+    backup = create_backup_data(
+        zone, record_sets, account_id, event, timestamp, include_resources
+    )
+    return upload_to_s3(backup, zone_name, account_id, event.event_name, timestamp)
+
+
+# -----------------------
+# Event Handlers
+# -----------------------
+def parse_event(event: EventBridgeEvent) -> EventInfo:
+    info = EventInfo()
+    if event.source == "aws.events" and event.detail_type == "Scheduled Event":
+        logger.info("Processing Scheduled Event")
+        return info
+    if (
+        event.source == "aws.route53"
+        and event.detail_type == "AWS API Call via CloudTrail"
+    ):
+        info.trigger_type = "change"
+        info.event_name = event.detail.get("eventName", "")
+        info.event_details = event.detail
+        req_params = event.detail.get("requestParameters", {})
+
+        if info.event_name == "ChangeCidrCollection":
+            logger.info("Processing ChangeCidrCollection event")
+            info.changes = req_params.get("changes", [])
+        if info.event_name == "UpdateHealthCheck":
+            logger.info("Processing UpdateHealthCheck event")
+            info.changes = req_params
+        if info.event_name == "UpdateTrafficPolicyInstance":
+            logger.info("Processing UpdateTrafficPolicyInstance event")
+            info.changes = get_traffic_policy(
+                req_params.get("trafficPolicyId", ""),
+                req_params.get("trafficPolicyVersion", ""),
+            )
+            info.affected_zone_id = normalize_zone_id(
+                event.detail["responseElements"]["trafficPolicyInstance"][
+                    "hostedZoneId"
+                ]
+            )
+        if info.event_name == "ChangeResourceRecordSets":
+            logger.info("Processing ChangeResourceRecordSets event")
+            info.changes = req_params.get("changeBatch", {}).get("changes", [])
+            info.affected_zone_id = normalize_zone_id(req_params["hostedZoneId"])
+        logger.info(f"Extracted {len(info.changes) if info.changes else 0} changes")
+        logger.info(
+            f"Processing change event: {info.event_name}, zone ID: {info.affected_zone_id}"
+        )
+    return info
+
+
+def handle_scheduled_event(
+    account_id: str, event_info: EventInfo, timestamp: str
+) -> None:
+    zones = get_hosted_zones()
+    if not zones:
+        logger.warning("No hosted zones available for backup")
+        return
+    for zone in zones:
+        # Process each zone with its record sets and additional resources
+        process_zone_backup(
+            zone,
+            account_id,
+            event_info,
+            timestamp,
+            get_record_sets,
+            include_resources=True,
+        )
+
+
+def handle_change_event(account_id: str, event_info: EventInfo, timestamp: str) -> None:
+    zone = {}
+    if event_info.affected_zone_id:
+        try:
+            zone = aws_route53.get_hosted_zone(Id=event_info.affected_zone_id)[
+                "HostedZone"
+            ]
+            zone["Id"], zone["Name"] = normalize_zone_info(zone)
+        except Exception as e:
+            logger.error(f"Error retrieving hosted zone: {str(e)}")
+            zone = {"Id": event_info.affected_zone_id, "Name": "Unknown"}
+    if event_info.event_name in {"ChangeCidrCollection", "UpdateHealthCheck"}:
+        # Use fallback zone name for certain change events
+        fallback_name = {
+            "ChangeCidrCollection": "CIDRCollection",
+            "UpdateHealthCheck": "HealthCheckUpdate",
+        }.get(event_info.event_name, "Unknown")
+        zone = {
+            "Id": event_info.affected_zone_id or fallback_name,
+            "Name": fallback_name,
+        }
+    process_zone_backup(
+        zone, account_id, event_info, timestamp, lambda _: [], include_resources=False
+    )
+
+
+@logger.inject_lambda_context(log_event=True)
+@event_source(data_class=EventBridgeEvent)
+def handler(event: EventBridgeEvent, context: LambdaContext) -> None:
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y%m%dT%H%M%S.%fZ"
+    )[:-3]
+    event_info = parse_event(event)
+    account_id = event.account
+    if event_info.is_scheduled_event:
+        handle_scheduled_event(account_id, event_info, timestamp)
+    elif event_info.is_change_event:
+        handle_change_event(account_id, event_info, timestamp)
+    else:
+        logger.warning("Unsupported event type")

@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template for Route 53 Backup Central Storage"
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name for the central backup S3 bucket. Account ID and region will be appended to the name as suffix.
+    Default: route53-backup-central
+
+  BackupFolderName:
+    Type: String
+    Description: Prefix for Route 53 backup files in the S3 bucket
+    Default: route53-backup
+
+Resources:
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketName}-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: Route53Backup
+
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCrossAccountWriteAccess
+            Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${BackupBucket}/${BackupFolderName}/*"
+            Condition:
+              ArnLike:
+                "aws:PrincipalArn": "arn:aws:iam::*:role/Route53BackupLambdaRole"
+
+Outputs:
+  BucketName:
+    Description: Name of the backup S3 bucket
+    Value: !Ref BackupBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketName"
+
+  BackupPrefix:
+    Description: Prefix for Route 53 backup files
+    Value: !Ref BackupFolderName
+    Export:
+      Name: !Sub "${AWS::StackName}-BackupPrefix"

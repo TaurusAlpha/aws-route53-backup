@@ -1,0 +1,29 @@
+# macOS specific files
+.DS_Store
+
+# Python specific files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+.eggs/
+
+# Virtual environment
+venv/
+.env
+
+# Logs
+*.log
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+
+# Other
+*.bak
+*.tmp
+*.old
+*.orig
