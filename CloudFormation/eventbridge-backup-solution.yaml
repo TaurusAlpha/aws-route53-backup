@@ -490,7 +490,6 @@ Resources:
                   if info.event_name == "ChangeCidrCollection":
                       logger.info("Processing ChangeCidrCollection event")
                       info.changes = req_params.get("changes", [])
-                      info.affected_zone_id = normalize_zone_id(req_params["hostedZoneId"])
                   if info.event_name == "UpdateHealthCheck":
                       logger.info("Processing UpdateHealthCheck event")
                       info.changes = req_params
@@ -501,13 +500,14 @@ Resources:
                           req_params.get("trafficPolicyVersion", ""),
                       )
                       info.affected_zone_id = normalize_zone_id(
-                          event.detail["responseParameters"]["trafficPolicyInstance"][
+                          event.detail["responseElements"]["trafficPolicyInstance"][
                               "hostedZoneId"
                           ]
                       )
                   if info.event_name == "ChangeResourceRecordSets":
                       logger.info("Processing ChangeResourceRecordSets event")
                       info.changes = req_params.get("changeBatch", {}).get("changes", [])
+                      info.affected_zone_id = normalize_zone_id(req_params["hostedZoneId"])
                   logger.info(f"Extracted {len(info.changes) if info.changes else 0} changes")
                   logger.info(
                       f"Processing change event: {info.event_name}, zone ID: {info.affected_zone_id}"
