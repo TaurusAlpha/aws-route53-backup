@@ -148,7 +148,6 @@ Resources:
             - route53.amazonaws.com
           eventName:
             - ChangeResourceRecordSets
-            - CreateHostedZone
             - UpdateHealthCheck
             - ChangeCidrCollection
             - UpdateTrafficPolicyInstance
